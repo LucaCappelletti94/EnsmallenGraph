@@ -576,30 +576,20 @@ impl Graph {
             ));
         }
         let verbose = verbose.unwrap_or(true);
-        let thread_shared_components =
-            ThreadDataRaceAware::new(vec![NODE_NOT_PRESENT; self.get_nodes_number() as usize]);
+        let mut connected_components = vec![NODE_NOT_PRESENT; self.get_nodes_number() as usize];
         let mut component_sizes = Vec::new();
 
-        let progress_bar = get_loading_bar(
-            verbose,
-            "Computing connected components",
-            self.get_nodes_number() as usize,
-        );
-
-        for node_id in self.iter_node_ids().progress_with(progress_bar) {
-            let this_node_component_id =
-                unsafe { (*thread_shared_components.value.get())[node_id as usize] };
+        for node_id in self.iter_node_ids() {
+            let this_node_component_id = connected_components[node_id as usize];
             if this_node_component_id != NODE_NOT_PRESENT {
                 component_sizes[this_node_component_id as usize] += 1;
                 continue;
             }
-
             let this_node_component_id = component_sizes.len() as NodeT;
             component_sizes.push(1);
             let mut frontier = vec![node_id];
-            unsafe {
-                (*thread_shared_components.value.get())[node_id as usize] = this_node_component_id;
-            }
+            connected_components[node_id as usize] = this_node_component_id;
+            let thread_shared_components = ThreadDataRaceAware::new(&mut connected_components);
             while !frontier.is_empty() {
                 frontier = frontier
                     .into_par_iter()
@@ -628,7 +618,7 @@ impl Graph {
             component_sizes.into_par_iter().argminmax().unwrap();
 
         Ok((
-            thread_shared_components.value.into_inner(),
+            connected_components,
             components_number,
             min_component_size,
             max_component_size,
