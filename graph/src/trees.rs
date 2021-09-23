@@ -562,7 +562,7 @@ impl Graph {
     /// # Raises
     /// * If the given graph is directed.
     /// * If the system configuration does not allow for the creation of the thread pool.
-    pub fn connected_components(
+    pub fn get_connected_components(
         &self,
         verbose: Option<bool>,
     ) -> Result<(Vec<NodeT>, NodeT, NodeT, NodeT)> {
