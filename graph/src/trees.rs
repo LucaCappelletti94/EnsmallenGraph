@@ -604,7 +604,6 @@ impl Graph {
                 frontier = frontier
                     .into_par_iter()
                     .flat_map_iter(|node_id| unsafe {
-                        // The scan is only needed in multi-graphs
                         self.iter_unchecked_neighbour_node_ids_from_source_node_id(node_id)
                     })
                     .filter_map(|neighbour_node_id| unsafe {
