@@ -4,9 +4,9 @@ use indicatif::ProgressIterator;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::{collections::HashSet, sync::atomic::AtomicU32};
 use vec_rand::xorshift::xorshift as rand_u64;
 
 /// # Implementation of algorithms relative to trees.
@@ -542,9 +542,12 @@ impl Graph {
         ))
     }
 
-    /// Compute the connected components through a parallel BFS.
+    /// Compute the connected components building in parallel a spanning tree using [bader's algorithm](https://www.sciencedirect.com/science/article/abs/pii/S0743731505000882).
     ///
     /// **This works only for undirected graphs.**
+    ///
+    /// This method is **not thread save and not deterministic** but by design of the algorithm this
+    /// shouldn't matter but if we will encounter non-detemristic bugs here is where we want to look.
     ///
     /// The returned quadruple contains:
     /// - Vector of the connected component for each node.
@@ -559,10 +562,11 @@ impl Graph {
     /// # Raises
     /// * If the given graph is directed.
     /// * If the system configuration does not allow for the creation of the thread pool.
-    pub fn get_connected_components(
+    pub fn connected_components(
         &self,
         verbose: Option<bool>,
     ) -> Result<(Vec<NodeT>, NodeT, NodeT, NodeT)> {
+        // TODO! refactor atomics
         self.must_be_undirected()?;
         if !self.has_nodes() {
             return Ok((Vec::new(), 0, 0, 0));
@@ -575,50 +579,174 @@ impl Graph {
                 1,
             ));
         }
-        let verbose = verbose.unwrap_or(true);
-        let mut connected_components = vec![NODE_NOT_PRESENT; self.get_nodes_number() as usize];
-        let mut component_sizes = Vec::new();
+        let verbose = verbose.unwrap_or(false);
 
-        for node_id in self.iter_node_ids() {
-            let this_node_component_id = connected_components[node_id as usize];
-            if this_node_component_id != NODE_NOT_PRESENT {
-                component_sizes[this_node_component_id as usize] += 1;
-                continue;
-            }
-            let this_node_component_id = component_sizes.len() as NodeT;
-            component_sizes.push(1);
-            let mut frontier = vec![node_id];
-            connected_components[node_id as usize] = this_node_component_id;
-            let thread_shared_components = ThreadDataRaceAware::new(&mut connected_components);
-            while !frontier.is_empty() {
-                frontier = frontier
-                    .into_par_iter()
-                    .flat_map_iter(|node_id| unsafe {
-                        self.iter_unchecked_neighbour_node_ids_from_source_node_id(node_id)
-                    })
-                    .filter_map(|neighbour_node_id| unsafe {
-                        if (*thread_shared_components.value.get())[neighbour_node_id as usize]
-                            == NODE_NOT_PRESENT
-                        {
-                            // Set the component of the node
-                            (*thread_shared_components.value.get())[neighbour_node_id as usize] =
-                                this_node_component_id;
-                            // add the node to the nodes to explore
-                            Some(neighbour_node_id)
-                        } else {
-                            None
+        let components = self
+            .iter_node_ids()
+            .map(|_| AtomicU32::new(NODE_NOT_PRESENT))
+            .collect::<Vec<_>>();
+        let mut min_component_size: NodeT = NodeT::MAX;
+        let mut max_component_size: NodeT = 0;
+        let mut components_number: NodeT = 0;
+        let (cpu_number, pool) = get_thread_pool()?;
+        let shared_stacks: Arc<Vec<Mutex<Vec<NodeT>>>> = Arc::from(
+            (0..std::cmp::max(cpu_number - 1, 1))
+                .map(|_| Mutex::from(Vec::new()))
+                .collect::<Vec<Mutex<Vec<NodeT>>>>(),
+        );
+        let active_nodes_number = AtomicUsize::new(0);
+        let current_component_size = AtomicU32::new(0);
+        let completed = AtomicBool::new(false);
+        let thread_safe_min_component_size = ThreadDataRaceAware {
+            value: std::cell::UnsafeCell::new(&mut min_component_size),
+        };
+        let thread_safe_max_component_size = ThreadDataRaceAware {
+            value: std::cell::UnsafeCell::new(&mut max_component_size),
+        };
+        let thread_safe_components_number = ThreadDataRaceAware {
+            value: std::cell::UnsafeCell::new(&mut components_number),
+        };
+
+        // since we were able to build a stub tree with cpu.len() leafs,
+        // we spawn the treads and make anyone of them build the sub-trees.
+        pool.scope(|s| {
+            // for each leaf of the previous stub tree start a DFS keeping track
+            // of which nodes we visited and updating accordingly the components vector.
+            // the nice trick here is that, since all the leafs are part of the same tree,
+            // if two processes find the same node, we don't care which one of the two take
+            // it so we can proceed in a lockless fashion (and maybe even without atomics
+            // if we manage to remove the colors vecotr and only keep the components one)
+            s.spawn(|_| {
+                let pb = get_loading_bar(
+                    verbose,
+                    format!(
+                        "Computing connected components of graph {}",
+                        self.get_name()
+                    )
+                    .as_ref(),
+                    self.get_nodes_number() as usize,
+                );
+                let min_component_size = thread_safe_min_component_size.value.get();
+                let max_component_size = thread_safe_max_component_size.value.get();
+                let components_number = thread_safe_components_number.value.get();
+                self.iter_node_ids()
+                    .progress_with(pb)
+                    .for_each(|src| {
+                        // If the node has already been explored we skip ahead.
+                        if components[src as usize].load(Ordering::Relaxed) != NODE_NOT_PRESENT {
+                            return;
                         }
-                    })
-                    .collect::<Vec<NodeT>>();
-            }
+
+                        // find the first not explored node (this is guardanteed to be in a new component)
+                        if self.has_disconnected_nodes()
+                            && (unsafe{self.is_unchecked_singleton_from_node_id(src)
+                                || self.is_unchecked_singleton_with_selfloops_from_node_id(src)})
+                        {
+                            // We set singletons as self-loops for now.
+                            unsafe {
+                                components[src as usize]
+                                    .store(**components_number, Ordering::Relaxed);
+                                **components_number += 1;
+                                **min_component_size = 1;
+                                **max_component_size = (**max_component_size).max(1);
+                            }
+                            return;
+                        }
+
+                        loop {
+                            // if the node has been now mapped to a component by anyone of the
+                            // parallel threads, move on to the next node.
+                            if components[src as usize].load(Ordering::Relaxed) != NODE_NOT_PRESENT {
+                                break;
+                            }
+                            // Otherwise, Check if the parallel threads are finished
+                            // and are all waiting for a new node to explore.
+                            // In that case add the currently not explored node to the
+                            // work stack of the first thread.
+                            if active_nodes_number.load(Ordering::Relaxed) == 0 {
+                                // The check here might seems redundant but its' needed
+                                // to prevent data races.
+                                //
+                                // If the last parallel thread finishes its stack between the
+                                // presence check above and the active nodes numbers check
+                                // the src node will never increase the component size and thus
+                                // leading to wrong results.
+                                if components[src as usize].load(Ordering::Relaxed) != NODE_NOT_PRESENT {
+                                    break;
+                                }
+                                let ccs =
+                                    current_component_size.swap(1, Ordering::Relaxed) as NodeT;
+                                unsafe {
+                                    **max_component_size = (**max_component_size).max(ccs);
+                                    if ccs > 1 {
+                                        **min_component_size = (**min_component_size).min(ccs);
+                                    }
+                                    components[src as usize]
+                                        .store(**components_number, Ordering::Relaxed);
+                                    **components_number += 1;
+                                }
+                                active_nodes_number.fetch_add(1, Ordering::Relaxed);
+                                shared_stacks[0].lock().expect("The lock is poisoned from the panic of another thread").push(src);
+                                break;
+                            }
+                            // Otherwise, Loop until the parallel threads are finished.
+                        }
+                    });
+                completed.store(true, Ordering::Relaxed);
+            });
+
+            // Spawn the parallel threads that handle the components mapping,
+            // these threads use work-stealing, meaning that if their stack is empty,
+            // they will steal nodes from the stack of another random thread.
+            (0..shared_stacks.len()).for_each(|_| {
+                s.spawn(|_| {
+                    let thread_id = rayon::current_thread_index().expect("current_thread_id not called from a rayon thread. This should not be possible because this is in a Rayon Thread Pool.");
+                    'outer: loop {
+                    // get the id, we use this as an idex for the stacks vector.
+
+                    let src = 'inner: loop {
+                        {
+                            for mut stack in (thread_id..(shared_stacks.len() + thread_id))
+                                .map(|id| shared_stacks[id % shared_stacks.len()].lock().expect("The lock is poisoned from the panic of another thread"))
+                            {
+                                if let Some(src) = stack.pop() {
+                                    break 'inner src;
+                                }
+                            }
+
+                            if completed.load(Ordering::Relaxed) {
+                                break 'outer;
+                            }
+                        }
+                    };
+
+                    let src_component = components[src as usize].load(Ordering::Relaxed);
+                    unsafe{self.iter_unchecked_neighbour_node_ids_from_source_node_id(src)}
+                        .for_each(|dst| {
+                            if components[dst as usize].swap(src_component, Ordering::SeqCst)
+                                == NODE_NOT_PRESENT
+                            {
+                                active_nodes_number.fetch_add(1, Ordering::SeqCst);
+                                current_component_size.fetch_add(1, Ordering::SeqCst);
+                                shared_stacks[rand_u64(dst as u64) as usize % shared_stacks.len()]
+                                    .lock()
+                                    .expect("The lock is poisoned from the panic of another thread")
+                                    .push(dst);
+                            }
+                        });
+                    active_nodes_number.fetch_sub(1, Ordering::SeqCst);
+                }});
+            });
+        });
+
+        let ccs = current_component_size.load(Ordering::SeqCst);
+        max_component_size = max_component_size.max(ccs);
+        if ccs > 1 {
+            min_component_size = min_component_size.min(ccs);
         }
 
-        let components_number = component_sizes.len() as NodeT;
-        let ((_, min_component_size), (_, max_component_size)) =
-            component_sizes.into_par_iter().argminmax().unwrap();
-
         Ok((
-            connected_components,
+            unsafe { std::mem::transmute::<Vec<AtomicU32>, Vec<NodeT>>(components) },
             components_number,
             min_component_size,
             max_component_size,
