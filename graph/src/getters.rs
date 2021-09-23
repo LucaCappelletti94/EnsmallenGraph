@@ -26,7 +26,7 @@ impl Graph {
         } else {
             info!("Executing undirected parallel version of connected components.");
             let (_, components_number, min_component_size, max_component_size) =
-                self.connected_components(verbose).unwrap();
+                self.get_connected_components(verbose).unwrap();
             (components_number, min_component_size, max_component_size)
         }
     }
@@ -1153,7 +1153,7 @@ impl Graph {
     pub fn get_node_connected_component_ids(&self, verbose: Option<bool>) -> Vec<NodeT> {
         match self.directed {
             true => self.spanning_arborescence_kruskal(verbose).1,
-            false => self.connected_components(verbose).unwrap().0,
+            false => self.get_connected_components(verbose).unwrap().0,
         }
     }
 

@@ -34,7 +34,7 @@ fn test_components_size() {
     for _ in 0..n {
         pb.inc(1);
         let (components, _components_number, smallest, biggest) =
-            g.connected_components(None).unwrap();
+            g.get_connected_components(None).unwrap();
         assert!(
             biggest >= smallest,
             "smallest: {} biggest: {}",
@@ -65,7 +65,7 @@ fn test_components_size() {
     }
 
     let (components, number_of_components, smallest, biggest) =
-        g.connected_components(None).unwrap();
+        g.get_connected_components(None).unwrap();
 
     assert_eq!(components, [0, 0, 1, 1, 2, 2].to_vec());
     assert_eq!(number_of_components, 3);

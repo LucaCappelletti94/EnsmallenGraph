@@ -957,7 +957,7 @@ pub fn test_graph_properties(graph: &Graph, verbose: Option<bool>) -> Result<()>
     if !graph.is_directed() {
         // Checking that the connected components are a dense range.
         let (connected_components, total_connected_components, _, _) =
-            graph.connected_components(verbose).unwrap();
+            graph.get_connected_components(verbose).unwrap();
         let actual_components_number = connected_components.iter().unique().count() as NodeT;
         assert_eq!(
             actual_components_number,
